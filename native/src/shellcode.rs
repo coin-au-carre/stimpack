@@ -1078,7 +1078,7 @@ pub fn build_injected_code(
         );
     }
 
-    ctx.func_name[..func_name.as_bytes().len()].clone_from_slice(func_name.as_bytes());
+    ctx.func_name[..func_name.len()].clone_from_slice(func_name.as_bytes());
     code[ctx_ofs..ctx_ofs + mem::size_of::<InjectHookCtx>()]
         .clone_from_slice(unsafe { ctx.to_bytes() });
 

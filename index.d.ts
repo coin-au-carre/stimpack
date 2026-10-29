@@ -4,6 +4,12 @@ declare type Tagged<Token> = {
   readonly [tag]: Token
 }
 export type StimpackProcess = Tagged<'StimpackProcess'>
+export type LaunchOwner = Tagged<'LaunchOwner'>
+
+/** Owns exactly one launch, including cancellation before process creation finishes. */
+export function createLaunchOwner(): LaunchOwner
+/** Cancels the launch and confirms termination of its owned process, if already created. */
+export function terminateLaunchOwner(owner: LaunchOwner): Promise<void>
 
 /** Arguments that control the launch/injection process. */
 export interface LaunchArgs {
@@ -27,7 +33,7 @@ export interface LaunchArgs {
  * @returns A promise that resolves with the process object if successful, or rejects with an error
  *  otherwise.
  */
-export function launch(args: LaunchArgs): Promise<StimpackProcess>
+export function launch(args: LaunchArgs, owner?: LaunchOwner): Promise<StimpackProcess>
 
 /**
  * Waits for the given process to exit.

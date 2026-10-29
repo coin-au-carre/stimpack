@@ -35,6 +35,7 @@ use winapi::um::winnt::{
     SECTION_MAP_WRITE, SECTION_QUERY, SEC_COMMIT, SEC_IMAGE,
 };
 
+mod launch_owner;
 mod shellcode;
 
 macro_rules! log {
@@ -98,8 +99,8 @@ fn system_info() -> &'static SYSTEM_INFO {
     static mut INFO: mem::MaybeUninit<SYSTEM_INFO> = mem::MaybeUninit::uninit();
 
     unsafe {
-        INIT.call_once(|| GetNativeSystemInfo(INFO.as_mut_ptr()));
-        &*INFO.as_ptr()
+        INIT.call_once(|| GetNativeSystemInfo(ptr::addr_of_mut!(INFO).cast::<SYSTEM_INFO>()));
+        &*ptr::addr_of!(INFO).cast::<SYSTEM_INFO>()
     }
 }
 
@@ -330,6 +331,16 @@ impl Drop for DynamicCodeSection {
 
 pub struct Process {
     h: HANDLE,
+}
+
+struct ThreadHandle(HANDLE);
+
+impl Drop for ThreadHandle {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
 }
 
 struct TerminateOnDrop<'a>(&'a Process);
@@ -640,7 +651,7 @@ impl Process {
         })
     }
 
-    pub fn iter_regions(&self) -> MemRegionIter {
+    pub fn iter_regions(&self) -> MemRegionIter<'_> {
         MemRegionIter::new(self)
     }
 
@@ -830,12 +841,21 @@ fn start_injected(
     current_dir: &str,
     dll_path: &str,
     func_name: &str,
-) -> Result<Process> {
+    owner: Option<&launch_owner::LaunchOwner>,
+) -> Result<Arc<Process>> {
+    if let Some(owner) = owner {
+        owner.check()?;
+    }
     // Start the new process
     let (proc, main_thread) =
         Process::new_from_path(exe_path, args, current_dir).context("Failed to create process")?;
+    let main_thread = ThreadHandle(main_thread);
+    let proc = Arc::new(proc);
     log!("Process created");
     let terminate_on_err = TerminateOnDrop(&proc);
+    if let Some(owner) = owner {
+        owner.bind(Arc::clone(&proc))?;
+    }
 
     // Locate the exe image
     let (exe_base, exe_img) = find_exe(&proc).context("Failed to locate EXE image")?;
@@ -894,9 +914,17 @@ fn start_injected(
     .context("Failed to patch TLS callback entry")?;
     log!("TLS callback patched, resuming process..");
 
-    // Resume the process
+    // Resume only if the launch still belongs to an active caller.
+    if let Some(owner) = owner {
+        owner.check()?;
+    }
     unsafe {
-        ResumeThread(main_thread);
+        if ResumeThread(main_thread.0) == u32::MAX {
+            return Err(anyhow!(
+                "Resuming process failed: {}",
+                io::Error::last_os_error()
+            ));
+        }
     }
 
     mem::forget(terminate_on_err);
@@ -918,6 +946,14 @@ fn launch(mut cx: FunctionContext) -> JsResult<JsPromise> {
     let cx = &mut cx;
     let channel = cx.channel();
     let params = cx.argument::<JsObject>(0)?;
+    let owner = match cx.argument_opt(1) {
+        Some(value) if value.is_a::<JsUndefined, _>(cx) => None,
+        Some(value) => {
+            let owner = value.downcast_or_throw::<JsBox<Arc<launch_owner::LaunchOwner>>, _>(cx)?;
+            Some(Arc::clone(&owner))
+        }
+        None => None,
+    };
     let mut get_string = |name| Ok(params.get::<JsString, _, _>(cx, name)?.value(cx));
     let path = get_string("appPath")?;
     let args = get_string("args")?;
@@ -946,7 +982,14 @@ fn launch(mut cx: FunctionContext) -> JsResult<JsPromise> {
         INJECT_THREAD_COUNT.fetch_add(1, Ordering::Relaxed);
         let _decrement_on_func_exit = DecrementInjectThreadCount;
         let result = std::panic::catch_unwind(|| {
-            start_injected(&path, &args, &current_dir, &dll_path, &func)
+            start_injected(
+                &path,
+                &args,
+                &current_dir,
+                &dll_path,
+                &func,
+                owner.as_deref(),
+            )
         });
         let result = match result {
             Ok(res) => res,
@@ -961,7 +1004,7 @@ fn launch(mut cx: FunctionContext) -> JsResult<JsPromise> {
             }
         };
         let _ = deferred.try_settle_with(&channel, move |mut cx| match result {
-            Ok(process) => Ok(cx.boxed(Arc::new(process))),
+            Ok(process) => Ok(cx.boxed(process)),
             Err(e) => {
                 let msg = format!("{:?}", e);
                 cx.throw_error(msg)
@@ -998,6 +1041,8 @@ fn wait_for_exit(mut cx: FunctionContext) -> JsResult<JsPromise> {
 
 #[neon::main]
 fn main(mut cx: ModuleContext) -> NeonResult<()> {
+    cx.export_function("createLaunchOwner", launch_owner::create_launch_owner)?;
+    cx.export_function("terminateLaunchOwner", launch_owner::terminate_launch_owner)?;
     cx.export_function("launch", launch)?;
     cx.export_function("waitForExit", wait_for_exit)?;
     Ok(())

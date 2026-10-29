@@ -3,6 +3,19 @@ name: CI
 on: [push, pull_request]
 
 jobs:
+  api:
+    name: JS ownership API
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --locked --release --manifest-path native/Cargo.toml --target=x86_64-pc-windows-msvc
+      - run: Copy-Item native/target/x86_64-pc-windows-msvc/release/stimpack.dll native/index.node
+      - run: node test/launch-owner.cjs
+
   check:
     name: Check
     runs-on: windows-latest
